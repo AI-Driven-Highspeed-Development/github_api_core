@@ -1,0 +1,4 @@
+version: 0.0.1
+folder_path: cores/github_api_core
+type: core
+requirements: []

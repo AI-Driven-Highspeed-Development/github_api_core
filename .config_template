@@ -1,0 +1,6 @@
+{
+    "module_name": "github_api_core",
+    "path": {
+        "data": "./project/data/github_api_core"
+    }
+}
