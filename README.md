@@ -1,6 +1,6 @@
 # GitHub API Core
 
-High-level, dependency-light helper for working with GitHub repositories. It supports both:
+Small, dependency‑light helper for working with GitHub repositories. It supports both:
 - Entire repository clone (over SSH or HTTPS)
 - Single-file retrieval without cloning the whole repo
 
@@ -123,3 +123,7 @@ cores/github_api_core/
 ├─ requirements.txt   # module-specific deps (GitPython)
 └─ README.md          # this file
 ```
+
+## See also
+- YAML Reading Core: parse, validate, and save YAML content fetched from repos
+- Temp Files Manager: centralized temp directory creation and cleanup used by clone/fetch
