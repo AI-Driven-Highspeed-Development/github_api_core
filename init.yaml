@@ -1,4 +1,5 @@
 version: 0.0.1
 folder_path: cores/github_api_core
 type: core
-requirements: []
+requirements: 
+  - https://github.com/AI-Driven-Highspeed-Development/temp_files_manager.git
