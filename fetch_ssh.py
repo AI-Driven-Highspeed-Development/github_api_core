@@ -8,14 +8,15 @@ from git import Repo
 from utils.logger_util.logger import Logger
 from managers.temp_files_manager.temp_files_manager import TempFilesManager
 
-logger = Logger(name="GithubFetchSSH")
+_module_logger = Logger(name="GithubFetchSSH")
 
-def clone_repo(repo_url: str, dest_path: str) -> bool:
+def clone_repo(repo_url: str, dest_path: str, *, logger: Logger | None = None) -> bool:
+    local_logger = logger or _module_logger
     try:
         Repo.clone_from(repo_url, dest_path)
         return True
     except Exception as e:
-        logger.error(f"Error cloning repository: {e}")
+        local_logger.error(f"Error cloning repository: {e}")
         return False
 
 
@@ -24,9 +25,11 @@ def fetch_file_sparse(
     branch: str,
     relative_path: str,
     *,
-    temp_mgr: TempFilesManager
+    temp_mgr: TempFilesManager,
+    logger: Logger | None = None,
 ) -> Optional[bytes]:
     """Use shallow sparse-checkout over SSH to fetch a single file without a PAT."""
+    local_logger = logger or _module_logger
     temp_dir = temp_mgr.make_dir(prefix="git")
     try:
         subprocess.run(
@@ -54,10 +57,10 @@ def fetch_file_sparse(
             return f.read()
     except subprocess.CalledProcessError as e:
         msg = e.stderr.decode("utf-8", errors="replace") if e.stderr else str(e)
-        logger.error(f"sparse-checkout failed: {msg}")
+        local_logger.error(f"sparse-checkout failed: {msg}")
         return None
     except Exception as e:
-        logger.error(f"Error reading sparse-checkout file: {e}")
+        local_logger.error(f"Error reading sparse-checkout file: {e}")
         return None
     finally:
         temp_mgr.cleanup(temp_dir)
