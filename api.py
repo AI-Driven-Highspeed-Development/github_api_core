@@ -1,62 +1,189 @@
 from __future__ import annotations
 
-import os
-from typing import Optional
+import shutil
+import subprocess
+import json
+from typing import Any, Callable, Optional
 
-from managers.config_manager import ConfigManager
 from managers.temp_files_manager.temp_files_manager import TempFilesManager
 from utils.logger_util.logger import Logger
 
-from .url_utils import (
-    is_ssh_url,
-    to_ssh_url,
-    to_https_url,
-    https_repo_full_name,
-)
-from .fetch_https import fetch_raw_file
-from .fetch_ssh import clone_repo, fetch_file_sparse
-
+from .url_utils import GH_INSTALL_GUIDE, GH_LOGIN_GUIDE
 
 class GithubApi:
-    """High-level GitHub API for cloning repos and fetching single files.
-    Assumes no GitHub CLI. Uses SSH for git ops when URL is SSH; otherwise HTTPS.
-    """
+    """GitHub CLI helper providing repo-agnostic operations."""
 
     def __init__(
         self,
-        url: str,
-        branch: Optional[str] = None,
+        *,
         token: Optional[str] = None,
         temp_mgr: Optional[TempFilesManager] = None,
         timeout: int = 15,
     ) -> None:
         self.logger = Logger(name=self.__class__.__name__)
-        self.cm = ConfigManager()
-
-        self.url = url.strip()
-        self.branch = branch or "main"
-        # Prefer explicit token, else env; only used for HTTPS raw/API
-        self.token = token or os.environ.get("GITHUB_TOKEN")
+        self.token = token
         self.timeout = timeout
-
-        # Precompute normalized forms
-        self.ssh_url = to_ssh_url(self.url)
-        self.https_url = to_https_url(self.url)
-        self.repo_full_name = https_repo_full_name(self.url)  # owner/repo
-
-        # Temp manager (use temp_files_manager module for temp paths)
+        self._gh_path = self.require_gh()
         self.temp_mgr = temp_mgr or TempFilesManager()
 
+    def repo(self, url: str, branch: Optional[str] = None) -> "GithubRepo":
+        """Create a repo-scoped helper bound to the provided URL."""
+        return GithubRepo(api=self, url=url, branch=branch)
+
     # ---------------- Public methods ----------------
-    def pull_repo(self, dest_path: Optional[str] = None) -> str | bool:
-        """Clone the repository to dest_path.
-        Returns dest_path on success, False on failure.
-        """
-        if not dest_path:
-            dest_path = self.temp_mgr.make_dir(prefix="clone")
-        repo_url = self.ssh_url if is_ssh_url(self.url) else self.https_url
-        ok = clone_repo(repo_url, dest_path, logger=self.logger)
-        return dest_path if ok else False
+    def create_repo(self, name_with_owner: str, *, private: bool = False, description: Optional[str] = None) -> bool:
+        """Create a new repository via GitHub CLI."""
+        if not name_with_owner or "/" not in name_with_owner:
+            raise ValueError("name_with_owner must be in the form 'owner/repo'")
+
+        cmd = [
+            self._gh_path,
+            "repo",
+            "create",
+            name_with_owner,
+            "--source",
+            ".",
+            "--public" if not private else "--private",
+            "--confirm",
+        ]
+
+        if description:
+            cmd.extend(["--description", description])
+
+        result = self._run(cmd)
+        if result.returncode != 0:
+            self.logger.error(
+                f"Failed to create {name_with_owner}: "
+                f"{result.stderr.decode('utf-8', errors='replace').strip()}"
+            )
+            return False
+
+        self.logger.info(f"Created repository {name_with_owner}.")
+        return True
+
+    def get_user_orgs(self) -> list[dict[str, Any]]:
+        """Return the authenticated user's organizations as dictionaries."""
+        cmd = [
+            self._gh_path,
+            "api",
+            "user/orgs",
+            "--paginate",
+            "--jq",
+            ".[]",
+        ]
+        result = self._run(cmd)
+        if result.returncode != 0:
+            self.logger.error(
+                "Failed to fetch user organizations: "
+                f"{result.stderr.decode('utf-8', errors='replace').strip()}"
+            )
+            return []
+
+        payload = result.stdout.decode("utf-8", errors="replace").strip()
+        if not payload:
+            return []
+
+        orgs: list[dict[str, Any]] = []
+        for line in payload.splitlines():
+            clean = line.strip()
+            if not clean:
+                continue
+            try:
+                orgs.append(json.loads(clean))
+            except json.JSONDecodeError as exc:
+                self.logger.error(f"Failed to parse organization entry: {exc}")
+                return []
+        return orgs
+
+    # ---------------- Static methods ----------------
+    @staticmethod
+    def require_gh() -> str:
+        gh_path = shutil.which("gh")
+        if not gh_path:
+            raise RuntimeError(GH_INSTALL_GUIDE)
+        version = subprocess.run([gh_path, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if version.returncode != 0:
+            raise RuntimeError(GH_INSTALL_GUIDE)
+        status = subprocess.run(
+            [gh_path, "auth", "status", "--hostname", "github.com"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if status.returncode != 0:
+            detail = status.stderr.decode("utf-8", errors="replace").strip()
+            message = f"{detail}\n\n{GH_LOGIN_GUIDE}" if detail else GH_LOGIN_GUIDE
+            raise RuntimeError(message)
+        return gh_path
+
+    # ---------------- Internal helpers ----------------
+    def _run(self, cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=self.timeout,
+        )
+
+
+class GithubRepo:
+    """Repository-scoped helper built on top of GithubApi."""
+
+    def __init__(self, api: GithubApi, *, url: str, branch: Optional[str] = None) -> None:
+        clean_url = url.strip()
+        if not clean_url:
+            raise ValueError("url must not be empty")
+
+        self.api = api
+        metadata = self._resolve_repo_metadata(self.api, clean_url, branch)
+        self.repo_full_name = metadata["name_with_owner"]
+        self.branch = metadata["branch"]
+        self.logger = Logger(name=f"{self.__class__.__name__}:{self.repo_full_name}")
+        self.logger.debug(
+            f"Initialized GithubRepo for repo {self.repo_full_name} on branch {self.branch}."
+        )
+
+    def clone_repo(
+        self,
+        dest_path: Optional[str] = None,
+        *,
+        callback: Optional[Callable[[str], Any]] = None,
+        clone_args: Optional[list[str]] = None,
+    ) -> Any:
+        """Clone the repository via GitHub CLI."""
+        if dest_path is None and callback is None:
+            raise ValueError("clone_repo requires dest_path or callback to be supplied.")
+
+        created_temp = dest_path is None
+        target = dest_path or self.api.temp_mgr.make_dir(prefix="clone")
+        clone_args = clone_args or ["--depth=1"]
+
+        branch = self.branch
+        if branch:
+            clone_args.extend(["--branch", branch])
+        cmd = [
+            self.api._gh_path,
+            "repo",
+            "clone",
+            self.repo_full_name,
+            target,
+            "--",
+            *clone_args,
+        ]
+        result = self.api._run(cmd)
+        if result.returncode == 0:
+            if callback:
+                try:
+                    return callback(target)
+                finally:
+                    if created_temp:
+                        self.api.temp_mgr.cleanup(target)
+            return target
+        self.logger.error(
+            f"Failed to clone {self.repo_full_name}: {result.stderr.decode('utf-8', errors='replace').strip()}"
+        )
+        if created_temp:
+            self.api.temp_mgr.cleanup(target)
+        return False
 
     def get_file(self, relative_path: str, *, encoding: str = "utf-8") -> Optional[str]:
         """Fetch a single file and return its decoded text."""
@@ -69,18 +196,87 @@ class GithubApi:
             return data.decode("utf-8", errors="replace")
 
     def get_file_bytes(self, relative_path: str) -> Optional[bytes]:
-        """Fetch a single file and return its bytes.
-        SSH URL -> sparse checkout via git (no token).
-        HTTPS URL -> raw.githubusercontent.com (token if provided).
-        """
-        if is_ssh_url(self.url):
-            return fetch_file_sparse(self.ssh_url, self.branch, relative_path, temp_mgr=self.temp_mgr, logger=self.logger)
-
-        # HTTPS path: requires token for private repos; public works without
-        if not self.repo_full_name:
-            self.logger.error("Unable to derive owner/repo from URL")
-            return None
-        return fetch_raw_file(self.repo_full_name, self.branch, relative_path, token=self.token, timeout=self.timeout)
+        """Fetch a single file via gh api."""
+        clean_path = relative_path.strip().lstrip("/")
+        if not clean_path:
+            raise ValueError("relative_path must not be empty")
+        cmd = [
+            self.api._gh_path,
+            "api",
+            f"repos/{self.repo_full_name}/contents/{clean_path}",
+            "-H",
+            "Accept: application/vnd.github.raw",
+        ]
+        if self.branch:
+            cmd.extend(["-f", f"ref={self.branch}"])
+        result = self.api._run(cmd)
+        if result.returncode == 0:
+            return result.stdout
+        self.logger.error(
+            f"Failed to fetch {clean_path}: {result.stderr.decode('utf-8', errors='replace').strip()}"
+        )
+        return None
 
     def cleanup_temp(self, path: str) -> None:
-        self.temp_mgr.cleanup(path)
+        self.api.temp_mgr.cleanup(path)
+
+    def _resolve_repo_metadata(self, branch_override: Optional[str]
+    ) -> dict[str, Optional[str]]:
+        if branch_override:
+            return {
+                "name_with_owner": GithubRepo._canonical_repo_name(self.api, self.url),
+                "branch": branch_override,
+            }
+
+        cmd = [
+            self.api._gh_path,
+            "repo",
+            "view",
+            self.url,
+            "--json",
+            "nameWithOwner,defaultBranchRef",
+            "--jq",
+            "{name_with_owner: .nameWithOwner, branch: .defaultBranchRef.name}",
+        ]
+        result = self.api._run(cmd)
+        if result.returncode != 0 or not result.stdout:
+            self.api.logger.debug(
+                "Using fallback canonical name; gh repo view failed to return metadata."
+            )
+            return {
+                "name_with_owner": GithubRepo._canonical_repo_name(self.api, self.url),
+                "branch": branch_override,
+            }
+
+        try:
+            parsed: dict[str, Optional[str]] = json.loads(result.stdout.decode("utf-8"))
+            if not parsed.get("name_with_owner"):
+                parsed["name_with_owner"] = GithubRepo._canonical_repo_name(self.api, self.url)
+            if branch_override:
+                parsed["branch"] = branch_override
+            return parsed
+        except Exception as exc:
+            self.api.logger.debug(f"Failed to parse gh repo view output: {exc}")
+            return {
+                "name_with_owner": GithubRepo._canonical_repo_name(self.api, self.url),
+                "branch": branch_override,
+            }
+
+    def _canonical_repo_name(self) -> str:
+        cmd = [
+            self.api._gh_path,
+            "repo",
+            "view",
+            self.url,
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ]
+        result = self.api._run(cmd)
+        if result.returncode == 0:
+            name = result.stdout.decode("utf-8", errors="replace").strip()
+            if name:
+                return name
+        raise ValueError("Unable to determine canonical repository name from GitHub CLI.")
+

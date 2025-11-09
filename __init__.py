@@ -1,4 +1,4 @@
-from .api import GithubApi
+from .api import GithubApi, GithubRepo
 
-__all__ = ["GithubApi"]
+__all__ = ["GithubApi", "GithubRepo"]
 
