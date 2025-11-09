@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import json
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from managers.temp_files_manager.temp_files_manager import TempFilesManager
@@ -31,7 +32,14 @@ class GithubApi:
         return GithubRepo(api=self, url=url, branch=branch)
 
     # ---------------- Public methods ----------------
-    def create_repo(self, name_with_owner: str, *, private: bool = False, description: Optional[str] = None) -> bool:
+    def create_repo(
+        self,
+        name_with_owner: str,
+        *,
+        private: bool = False,
+        description: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> bool:
         """Create a new repository via GitHub CLI."""
         if not name_with_owner or "/" not in name_with_owner:
             raise ValueError("name_with_owner must be in the form 'owner/repo'")
@@ -41,11 +49,12 @@ class GithubApi:
             "repo",
             "create",
             name_with_owner,
-            "--source",
-            ".",
             "--public" if not private else "--private",
             "--confirm",
         ]
+
+        if source:
+            cmd.extend(["--source", source])
 
         if description:
             cmd.extend(["--description", description])
@@ -95,6 +104,77 @@ class GithubApi:
                 return []
         return orgs
 
+    def get_authenticated_user_login(self) -> str:
+        """Return the login of the authenticated user."""
+        cmd = [self._gh_path, "api", "user", "--jq", ".login"]
+        result = self._run(cmd)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Failed to resolve authenticated user login: "
+                f"{result.stderr.decode('utf-8', errors='replace').strip()}"
+            )
+
+        login = result.stdout.decode("utf-8", errors="replace").strip()
+        if not login:
+            raise RuntimeError("GitHub CLI did not return an authenticated user login.")
+        return login
+
+    def push_initial_commit(
+        self,
+        repo_path: str | Path,
+        name_with_owner: str,
+        *,
+        branch: str = "main",
+        message: str = "init commit",
+    ) -> None:
+        """Initialize a git repo at repo_path and push the first commit to GitHub."""
+
+        target = Path(repo_path).expanduser().resolve()
+        if not target.is_dir():
+            raise ValueError(f"repo_path must be a directory: {repo_path}")
+
+        remote_url = f"https://github.com/{name_with_owner}.git"
+
+        # Initialize repository and create initial commit
+        init_result = self._run_git(["init"], cwd=target, check=False)
+        if init_result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to initialize git repository: {init_result.stderr.decode('utf-8', errors='replace').strip()}"
+            )
+
+        add_result = self._run_git(["add", "--all"], cwd=target, check=False)
+        if add_result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to stage project files: {add_result.stderr.decode('utf-8', errors='replace').strip()}"
+            )
+
+        commit_result = self._run_git(["commit", "-m", message], cwd=target, check=False)
+        if commit_result.returncode != 0:
+            detail = commit_result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Failed to create initial commit: {detail}")
+
+        branch_result = self._run_git(["branch", "-M", branch], cwd=target, check=False)
+        if branch_result.returncode != 0:
+            detail = branch_result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Failed to set branch to {branch}: {detail}")
+
+        remote_add = self._run_git(["remote", "add", "origin", remote_url], cwd=target, check=False)
+        if remote_add.returncode != 0:
+            # Attempt to update the remote if it already exists
+            remote_set = self._run_git(
+                ["remote", "set-url", "origin", remote_url], cwd=target, check=False
+            )
+            if remote_set.returncode != 0:
+                detail = remote_set.stderr.decode("utf-8", errors="replace").strip()
+                if not detail:
+                    detail = remote_add.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"Failed to configure remote origin: {detail}")
+
+        push_result = self._run_git(["push", "-u", "origin", branch], cwd=target, check=False)
+        if push_result.returncode != 0:
+            detail = push_result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Failed to push initial commit: {detail}")
+
     # ---------------- Static methods ----------------
     @staticmethod
     def require_gh() -> str:
@@ -124,6 +204,26 @@ class GithubApi:
             timeout=self.timeout,
         )
 
+    def _run_git(
+        self,
+        args: list[str],
+        *,
+        cwd: Path,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[bytes]:
+        cmd = ["git", *args]
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=self.timeout,
+        )
+        if check and result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Git command failed ({' '.join(cmd)}): {detail}")
+        return result
+
 
 class GithubRepo:
     """Repository-scoped helper built on top of GithubApi."""
@@ -134,7 +234,8 @@ class GithubRepo:
             raise ValueError("url must not be empty")
 
         self.api = api
-        metadata = self._resolve_repo_metadata(self.api, clean_url, branch)
+        self.url = clean_url
+        metadata = self._resolve_repo_metadata(self.api, self.url, branch)
         self.repo_full_name = metadata["name_with_owner"]
         self.branch = metadata["branch"]
         self.logger = Logger(name=f"{self.__class__.__name__}:{self.repo_full_name}")
@@ -220,60 +321,63 @@ class GithubRepo:
     def cleanup_temp(self, path: str) -> None:
         self.api.temp_mgr.cleanup(path)
 
-    def _resolve_repo_metadata(self, branch_override: Optional[str]
+    @staticmethod
+    def _resolve_repo_metadata(
+        api: GithubApi, url: str, branch_override: Optional[str]
     ) -> dict[str, Optional[str]]:
         if branch_override:
             return {
-                "name_with_owner": GithubRepo._canonical_repo_name(self.api, self.url),
+                "name_with_owner": GithubRepo._canonical_repo_name(api, url),
                 "branch": branch_override,
             }
 
         cmd = [
-            self.api._gh_path,
+            api._gh_path,
             "repo",
             "view",
-            self.url,
+            url,
             "--json",
             "nameWithOwner,defaultBranchRef",
             "--jq",
             "{name_with_owner: .nameWithOwner, branch: .defaultBranchRef.name}",
         ]
-        result = self.api._run(cmd)
+        result = api._run(cmd)
         if result.returncode != 0 or not result.stdout:
-            self.api.logger.debug(
+            api.logger.debug(
                 "Using fallback canonical name; gh repo view failed to return metadata."
             )
             return {
-                "name_with_owner": GithubRepo._canonical_repo_name(self.api, self.url),
+                "name_with_owner": GithubRepo._canonical_repo_name(api, url),
                 "branch": branch_override,
             }
 
         try:
             parsed: dict[str, Optional[str]] = json.loads(result.stdout.decode("utf-8"))
             if not parsed.get("name_with_owner"):
-                parsed["name_with_owner"] = GithubRepo._canonical_repo_name(self.api, self.url)
+                parsed["name_with_owner"] = GithubRepo._canonical_repo_name(api, url)
             if branch_override:
                 parsed["branch"] = branch_override
             return parsed
         except Exception as exc:
-            self.api.logger.debug(f"Failed to parse gh repo view output: {exc}")
+            api.logger.debug(f"Failed to parse gh repo view output: {exc}")
             return {
-                "name_with_owner": GithubRepo._canonical_repo_name(self.api, self.url),
+                "name_with_owner": GithubRepo._canonical_repo_name(api, url),
                 "branch": branch_override,
             }
 
-    def _canonical_repo_name(self) -> str:
+    @staticmethod
+    def _canonical_repo_name(api: GithubApi, url: str) -> str:
         cmd = [
-            self.api._gh_path,
+            api._gh_path,
             "repo",
             "view",
-            self.url,
+            url,
             "--json",
             "nameWithOwner",
             "--jq",
             ".nameWithOwner",
         ]
-        result = self.api._run(cmd)
+        result = api._run(cmd)
         if result.returncode == 0:
             name = result.stdout.decode("utf-8", errors="replace").strip()
             if name:
