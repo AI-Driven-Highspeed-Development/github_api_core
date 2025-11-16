@@ -8,23 +8,24 @@ from typing import Any, Callable, Optional
 
 from managers.temp_files_manager.temp_files_manager import TempFilesManager
 from utils.logger_util.logger import Logger
+from cores.exceptions_core.adhd_exceptions import ADHDError
 
-from .url_utils import GH_INSTALL_GUIDE, GH_LOGIN_GUIDE
+from cores.github_api_core.url_utils import GH_INSTALL_GUIDE, GH_LOGIN_GUIDE
 
 class GithubApi:
     """GitHub CLI helper providing repo-agnostic operations."""
 
+    # Cached path to the GitHub CLI; resolved once per process
+    _GH_PATH: Optional[str] = None
+
     def __init__(
         self,
         *,
-        token: Optional[str] = None,
         temp_mgr: Optional[TempFilesManager] = None,
         timeout: int = 15,
     ) -> None:
         self.logger = Logger(name=self.__class__.__name__)
-        self.token = token
         self.timeout = timeout
-        self._gh_path = self.require_gh()
         self.temp_mgr = temp_mgr or TempFilesManager()
 
     def repo(self, url: str, branch: Optional[str] = None) -> "GithubRepo":
@@ -34,15 +35,18 @@ class GithubApi:
     # ---------------- Public methods ----------------
     def create_repo(
         self,
-        name_with_owner: str,
+        owner: str,
+        name: str,
         *,
         private: bool = False,
         description: Optional[str] = None,
         source: Optional[str] = None,
     ) -> bool:
         """Create a new repository via GitHub CLI."""
-        if not name_with_owner or "/" not in name_with_owner:
-            raise ValueError("name_with_owner must be in the form 'owner/repo'")
+        if not owner or not name:
+            raise ValueError("owner and name must be non-empty")
+
+        name_with_owner = f"{owner}/{name}"
 
         cmd = [
             self._gh_path,
@@ -66,7 +70,6 @@ class GithubApi:
                 f"{result.stderr.decode('utf-8', errors='replace').strip()}"
             )
             return False
-
         self.logger.info(f"Created repository {name_with_owner}.")
         return True
 
@@ -109,20 +112,21 @@ class GithubApi:
         cmd = [self._gh_path, "api", "user", "--jq", ".login"]
         result = self._run(cmd)
         if result.returncode != 0:
-            raise RuntimeError(
+            raise ADHDError(
                 "Failed to resolve authenticated user login: "
                 f"{result.stderr.decode('utf-8', errors='replace').strip()}"
             )
 
         login = result.stdout.decode("utf-8", errors="replace").strip()
         if not login:
-            raise RuntimeError("GitHub CLI did not return an authenticated user login.")
+            raise ADHDError("GitHub CLI did not return an authenticated user login.")
         return login
 
     def push_initial_commit(
         self,
         repo_path: str | Path,
-        name_with_owner: str,
+        owner: str,
+        name: str,
         *,
         branch: str = "main",
         message: str = "init commit",
@@ -132,31 +136,31 @@ class GithubApi:
         target = Path(repo_path).expanduser().resolve()
         if not target.is_dir():
             raise ValueError(f"repo_path must be a directory: {repo_path}")
-
-        remote_url = f"https://github.com/{name_with_owner}.git"
+        # Build canonical HTTPS URL from owner and name
+        remote_url = self.build_repo_url(owner, name)
 
         # Initialize repository and create initial commit
         init_result = self._run_git(["init"], cwd=target, check=False)
         if init_result.returncode != 0:
-            raise RuntimeError(
+            raise ADHDError(
                 f"Failed to initialize git repository: {init_result.stderr.decode('utf-8', errors='replace').strip()}"
             )
 
         add_result = self._run_git(["add", "--all"], cwd=target, check=False)
         if add_result.returncode != 0:
-            raise RuntimeError(
+            raise ADHDError(
                 f"Failed to stage project files: {add_result.stderr.decode('utf-8', errors='replace').strip()}"
             )
 
         commit_result = self._run_git(["commit", "-m", message], cwd=target, check=False)
         if commit_result.returncode != 0:
             detail = commit_result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Failed to create initial commit: {detail}")
+            raise ADHDError(f"Failed to create initial commit: {detail}")
 
         branch_result = self._run_git(["branch", "-M", branch], cwd=target, check=False)
         if branch_result.returncode != 0:
             detail = branch_result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Failed to set branch to {branch}: {detail}")
+            raise ADHDError(f"Failed to set branch to {branch}: {detail}")
 
         remote_add = self._run_git(["remote", "add", "origin", remote_url], cwd=target, check=False)
         if remote_add.returncode != 0:
@@ -168,22 +172,43 @@ class GithubApi:
                 detail = remote_set.stderr.decode("utf-8", errors="replace").strip()
                 if not detail:
                     detail = remote_add.stderr.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"Failed to configure remote origin: {detail}")
+                raise ADHDError(f"Failed to configure remote origin: {detail}")
 
         push_result = self._run_git(["push", "-u", "origin", branch], cwd=target, check=False)
         if push_result.returncode != 0:
             detail = push_result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Failed to push initial commit: {detail}")
+            raise ADHDError(f"Failed to push initial commit: {detail}")
+
+    # ---------------- Convenience helpers ----------------
+    @staticmethod
+    def build_repo_url(owner: str, name: str) -> str:
+        """Return a canonical https GitHub repo URL for the given owner/name.
+
+        Spaces are converted to dashes to mirror gh repo create semantics.
+        """
+        sanitized_repo_name = GithubApi.sanitize_repo_name(name)
+        if not owner or not sanitized_repo_name:
+            raise ValueError("owner and name must be non-empty to build repo URL")
+        return f"https://github.com/{owner}/{sanitized_repo_name}.git"
+    
+    @staticmethod
+    def sanitize_repo_name(name: str) -> str:
+        """Sanitize a repository name by stripping whitespace and replacing spaces with dashes."""
+        sanitized_repo_name = name.strip().replace(" ", "-")
+        return sanitized_repo_name
 
     # ---------------- Static methods ----------------
-    @staticmethod
-    def require_gh() -> str:
+    @classmethod
+    def require_gh(cls) -> str:
+        """Resolve and validate the GitHub CLI path once, caching the result."""
+        if cls._GH_PATH:
+            return cls._GH_PATH
         gh_path = shutil.which("gh")
         if not gh_path:
-            raise RuntimeError(GH_INSTALL_GUIDE)
+            raise ADHDError(GH_INSTALL_GUIDE)
         version = subprocess.run([gh_path, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if version.returncode != 0:
-            raise RuntimeError(GH_INSTALL_GUIDE)
+            raise ADHDError(GH_INSTALL_GUIDE)
         status = subprocess.run(
             [gh_path, "auth", "status", "--hostname", "github.com"],
             stdout=subprocess.PIPE,
@@ -192,8 +217,14 @@ class GithubApi:
         if status.returncode != 0:
             detail = status.stderr.decode("utf-8", errors="replace").strip()
             message = f"{detail}\n\n{GH_LOGIN_GUIDE}" if detail else GH_LOGIN_GUIDE
-            raise RuntimeError(message)
+            raise ADHDError(message)
+        cls._GH_PATH = gh_path
         return gh_path
+
+    @property
+    def _gh_path(self) -> str:
+        """Expose the cached GH path via an instance property without re-checking."""
+        return self.__class__.require_gh()
 
     # ---------------- Internal helpers ----------------
     def _run(self, cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
@@ -221,7 +252,7 @@ class GithubApi:
         )
         if check and result.returncode != 0:
             detail = result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Git command failed ({' '.join(cmd)}): {detail}")
+            raise ADHDError(f"Git command failed ({' '.join(cmd)}): {detail}")
         return result
 
 

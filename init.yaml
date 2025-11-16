@@ -1,6 +1,8 @@
 version: 0.0.1
 folder_path: cores/github_api_core
 type: core
+repo_url: https://github.com/AI-Driven-Highspeed-Development/github_api_core.git
 requirements:
   - https://github.com/AI-Driven-Highspeed-Development/temp_files_manager.git
   - https://github.com/AI-Driven-Highspeed-Development/Logger-Util.git
+  - https://github.com/AI-Driven-Highspeed-Development/exceptions_core.git
