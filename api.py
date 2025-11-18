@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import base64
 import shutil
 import subprocess
 import json
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 from managers.temp_files_manager.temp_files_manager import TempFilesManager
 from utils.logger_util.logger import Logger
@@ -269,6 +270,7 @@ class GithubRepo:
         metadata = self._resolve_repo_metadata(self.api, self.url, branch)
         self.repo_full_name = metadata["name_with_owner"]
         self.branch = metadata["branch"]
+        self.owner, self.repo_name = self._split_name_with_owner(self.repo_full_name)
         self.logger = Logger(name=f"{self.__class__.__name__}:{self.repo_full_name}")
         self.logger.debug(
             f"Initialized GithubRepo for repo {self.repo_full_name} on branch {self.branch}."
@@ -332,18 +334,41 @@ class GithubRepo:
         clean_path = relative_path.strip().lstrip("/")
         if not clean_path:
             raise ValueError("relative_path must not be empty")
+        url = f"repos/{self.repo_full_name}/contents/{clean_path}"
+        if self.branch:
+            url = url + f"?ref={self.branch}"
         cmd = [
             self.api._gh_path,
             "api",
-            f"repos/{self.repo_full_name}/contents/{clean_path}",
-            "-H",
-            "Accept: application/vnd.github.raw",
+            url
         ]
-        if self.branch:
-            cmd.extend(["-f", f"ref={self.branch}"])
         result = self.api._run(cmd)
         if result.returncode == 0:
-            return result.stdout
+            output = result.stdout
+            if not output:
+                self.logger.error(f"File {clean_path} is empty.")
+                return b""
+            try:
+                payload = json.loads(output.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                self.logger.error(f"Failed to decode JSON for {clean_path}.")
+                return output
+
+            if isinstance(payload, dict):
+                content = payload.get("content")
+                encoding = payload.get("encoding")
+                if isinstance(content, str):
+                    normalized = content.strip().encode()
+                    if encoding == "base64":
+                        try:
+                            return base64.b64decode(normalized)
+                        except Exception as exc:
+                            self.logger.error(
+                                f"Failed to decode base64 content for {clean_path}: {exc}"
+                            )
+                            return None
+                    return normalized
+            return output
         self.logger.error(
             f"Failed to fetch {clean_path}: {result.stderr.decode('utf-8', errors='replace').strip()}"
         )
@@ -414,4 +439,15 @@ class GithubRepo:
             if name:
                 return name
         raise ValueError("Unable to determine canonical repository name from GitHub CLI.")
+
+    @staticmethod
+    def _split_name_with_owner(value: str) -> Tuple[str, str]:
+        if not value or "/" not in value:
+            raise ValueError("Repository full name must be in 'owner/name' format.")
+        owner, repo_name = value.split("/", 1)
+        owner = owner.strip()
+        repo_name = repo_name.strip()
+        if not owner or not repo_name:
+            raise ValueError("Repository owner and name must be non-empty.")
+        return owner, repo_name
 
