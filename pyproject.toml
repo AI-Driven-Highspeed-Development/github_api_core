@@ -16,11 +16,6 @@ Repository = "https://github.com/AI-Driven-Highspeed-Development/github_api_core
 type = "core"
 layer = "dev"
 
-[tool.uv.sources]
-logger-util = { workspace = true }
-exceptions-core = { workspace = true }
-temp-files-manager = { workspace = true }
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
