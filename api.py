@@ -7,11 +7,11 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
-from managers.temp_files_manager.temp_files_manager import TempFilesManager
-from utils.logger_util.logger import Logger
-from cores.exceptions_core.adhd_exceptions import ADHDError
+from temp_files_manager import TempFilesManager
+from logger_util import Logger
+from exceptions_core import ADHDError
 
-from cores.github_api_core.url_utils import GH_INSTALL_GUIDE, GH_LOGIN_GUIDE
+from .url_utils import GH_INSTALL_GUIDE, GH_LOGIN_GUIDE
 
 class GithubApi:
     """GitHub CLI helper providing repo-agnostic operations."""
