@@ -16,6 +16,11 @@ Repository = "https://github.com/AI-Driven-Highspeed-Development/github_api_core
 type = "core"
 layer = "dev"
 
+[tool.uv.sources]
+logger-util = { git = "https://github.com/AI-Driven-Highspeed-Development/Logger-Util.git" }
+exceptions-core = { git = "https://github.com/AI-Driven-Highspeed-Development/exceptions_core.git" }
+temp-files-manager = { git = "https://github.com/AI-Driven-Highspeed-Development/temp_files_manager.git" }
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
